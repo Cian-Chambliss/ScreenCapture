@@ -103,68 +103,232 @@ static void CaptureWindow(HWND hwnd) {
     RECT rcWin;
     if (!GetWindowRect(hwnd, &rcWin)) return;
     RECT rcExt = rcWin;
-    // Try to get extended frame bounds (includes DWM shadows)
     if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExt, sizeof(rcExt)))) {
-        // rcExt now may be larger than rcWin
+        // Prefer extended frame for seeding from screen (modern NC)
     }
     int extW = rcExt.right - rcExt.left;
     int extH = rcExt.bottom - rcExt.top;
     if (extW <= 0 || extH <= 0) return;
 
-    // Strategy: capture from screen first (visible content, includes border/shadow),
-    // then try PrintWindow to overlay the exact window contents (helps with occlusion).
-    HBITMAP hBitmap = NULL;
+    // Seed with what is on screen (gets modern NC/title)
     HDC hScreenDC = GetDC(NULL);
     if (!hScreenDC) return;
     HDC hExtDC = CreateCompatibleDC(hScreenDC);
     HBITMAP hExtBmp = CreateCompatibleBitmap(hScreenDC, extW, extH);
-    if (hExtBmp && hExtDC) {
-        HBITMAP hExtOld = (HBITMAP)SelectObject(hExtDC, hExtBmp);
-        // First, copy what's on screen over the extended bounds
-        BitBlt(hExtDC, 0, 0, extW, extH, hScreenDC, rcExt.left, rcExt.top, SRCCOPY);
-
-        // Now attempt PrintWindow into a window-sized temp and overlay into extended bmp
-        int winW = rcWin.right - rcWin.left;
-        int winH = rcWin.bottom - rcWin.top;
-        HDC hWinDC = CreateCompatibleDC(hScreenDC);
-        HBITMAP hWinBmp = CreateCompatibleBitmap(hScreenDC, winW, winH);
-        if (hWinDC && hWinBmp) {
-            HBITMAP hWinOld = (HBITMAP)SelectObject(hWinDC, hWinBmp);
-            BOOL ok = PrintWindow(hwnd, hWinDC, 0 /* flags 0 give more consistent output */);
-            int dx = rcWin.left - rcExt.left;
-            int dy = rcWin.top - rcExt.top;
-            if (ok) {
-                BitBlt(hExtDC, dx, dy, winW, winH, hWinDC, 0, 0, SRCCOPY);
-            }
-            SelectObject(hWinDC, hWinOld);
-        }
-        if (hWinBmp) DeleteObject(hWinBmp);
-        if (hWinDC) DeleteDC(hWinDC);
-
-        SelectObject(hExtDC, hExtOld);
-        hBitmap = hExtBmp;
-    } else if (hExtBmp) {
-        DeleteObject(hExtBmp);
-    }
-    if (hExtDC) DeleteDC(hExtDC);
-    ReleaseDC(NULL, hScreenDC);
-
-    if (!hBitmap) return;
-
-    // Convert HBITMAP to GDI+ Bitmap
-    Bitmap bitmap(hBitmap, NULL);
-    // Build filename
-    std::wstring path = GenerateFileName(hwnd);
-    path = EnsureUniquePath(path);
-    // Get PNG encoder CLSID
-    CLSID pngClsid;
-    if (GetEncoderClsid(L"image/png", &pngClsid) < 0) {
-        DeleteObject(hBitmap);
+    if (!hExtDC || !hExtBmp) {
+        if (hExtBmp) DeleteObject(hExtBmp);
+        if (hExtDC) DeleteDC(hExtDC);
+        ReleaseDC(NULL, hScreenDC);
         return;
     }
-    // Save to file
-    bitmap.Save(path.c_str(), &pngClsid, NULL);
-    DeleteObject(hBitmap);
+    HBITMAP hExtOld = (HBITMAP)SelectObject(hExtDC, hExtBmp);
+    BitBlt(hExtDC, 0, 0, extW, extH, hScreenDC, rcExt.left, rcExt.top, SRCCOPY);
+
+    // Overlay client area only using PrintWindow to avoid legacy NC rendering
+    RECT rcClient; GetClientRect(hwnd, &rcClient);
+    POINT ptClient = {0, 0}; ClientToScreen(hwnd, &ptClient);
+    int cW = rcClient.right - rcClient.left;
+    int cH = rcClient.bottom - rcClient.top;
+    if (cW > 0 && cH > 0) {
+        HDC hCliDC = CreateCompatibleDC(hScreenDC);
+        HBITMAP hCliBmp = CreateCompatibleBitmap(hScreenDC, cW, cH);
+        if (hCliDC && hCliBmp) {
+            HBITMAP hCliOld = (HBITMAP)SelectObject(hCliDC, hCliBmp);
+            if (PrintWindow(hwnd, hCliDC, PW_CLIENTONLY)) {
+                int dx = ptClient.x - rcExt.left;
+                int dy = ptClient.y - rcExt.top;
+                BitBlt(hExtDC, dx, dy, cW, cH, hCliDC, 0, 0, SRCCOPY);
+            }
+            SelectObject(hCliDC, hCliOld);
+        }
+        if (hCliBmp) DeleteObject(hCliBmp);
+        if (hCliDC) DeleteDC(hCliDC);
+    }
+
+    SelectObject(hExtDC, hExtOld);
+    ReleaseDC(NULL, hScreenDC);
+
+    // Save
+    Bitmap bitmap(hExtBmp, NULL);
+    std::wstring path = GenerateFileName(hwnd);
+    path = EnsureUniquePath(path);
+    CLSID pngClsid;
+    if (GetEncoderClsid(L"image/png", &pngClsid) >= 0) {
+        bitmap.Save(path.c_str(), &pngClsid, NULL);
+    }
+    DeleteObject(hExtBmp);
+    DeleteDC(hExtDC);
+}
+
+// Helper to get extended frame bounds; falls back to GetWindowRect
+static BOOL GetExtendedRect(HWND hwnd, RECT* prc) {
+    if (!IsWindow(hwnd) || !prc) return FALSE;
+    RECT r;
+    if (!GetWindowRect(hwnd, &r)) return FALSE;
+    RECT rex = r;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rex, sizeof(rex)))) {
+        *prc = rex;
+        return TRUE;
+    }
+    *prc = r;
+    return TRUE;
+}
+
+static HWND ResolveTopLevel(HWND h) {
+    if (!IsWindow(h)) return NULL;
+    return GetAncestor(h, GA_ROOT);
+}
+
+static HWND FindLikelyParentByPoint(HWND child) {
+    if (!IsWindow(child)) return NULL;
+    RECT rc{};
+    if (!GetWindowRect(child, &rc)) return NULL;
+    int cx = rc.left + (rc.right - rc.left) / 2;
+    // Try a couple of offsets above the top edge to get the window under the dialog
+    const int offsets[] = { 6, 14, 24 };
+    for (int d : offsets) {
+        POINT pt{ cx, rc.top - d };
+        HWND h = WindowFromPoint(pt);
+        if (h && IsWindowVisible(h)) {
+            HWND top = ResolveTopLevel(h);
+            if (top && top != ResolveTopLevel(child)) return top;
+        }
+    }
+    // Fallback: owner chain
+    return GetAncestor(child, GA_ROOTOWNER);
+}
+
+// Render a single window to a bitmap sized to its extended bounds. Includes modern NC/shadows
+// by seeding from the screen, then overlays the client via PrintWindow to remove occlusions.
+static HBITMAP RenderWindowBitmap(HWND hwnd, RECT* outExt) {
+    if (outExt) SetRectEmpty(outExt);
+    if (!IsWindow(hwnd)) return NULL;
+    RECT rcWin{}; if (!GetWindowRect(hwnd, &rcWin)) return NULL;
+    RECT rcExt = rcWin; GetExtendedRect(hwnd, &rcExt);
+    int w = rcExt.right - rcExt.left;
+    int h = rcExt.bottom - rcExt.top;
+    if (w <= 0 || h <= 0) return NULL;
+
+    HDC hScreen = GetDC(NULL);
+    if (!hScreen) return NULL;
+    HDC hMem = CreateCompatibleDC(hScreen);
+    HBITMAP hBmp = CreateCompatibleBitmap(hScreen, w, h);
+    if (!hMem || !hBmp) {
+        if (hBmp) DeleteObject(hBmp);
+        if (hMem) DeleteDC(hMem);
+        ReleaseDC(NULL, hScreen);
+        return NULL;
+    }
+    HBITMAP hOld = (HBITMAP)SelectObject(hMem, hBmp);
+    // Seed with what's on screen (modern NC and shadows)
+    BitBlt(hMem, 0, 0, w, h, hScreen, rcExt.left, rcExt.top, SRCCOPY);
+
+    // Overlay client content
+    RECT rcCli{}; GetClientRect(hwnd, &rcCli);
+    POINT ptCli{0,0}; ClientToScreen(hwnd, &ptCli);
+    int cw = rcCli.right - rcCli.left;
+    int ch = rcCli.bottom - rcCli.top;
+    if (cw > 0 && ch > 0) {
+        HDC hCli = CreateCompatibleDC(hScreen);
+        HBITMAP hCliBmp = CreateCompatibleBitmap(hScreen, cw, ch);
+        if (hCli && hCliBmp) {
+            HBITMAP hCliOld = (HBITMAP)SelectObject(hCli, hCliBmp);
+            if (PrintWindow(hwnd, hCli, PW_CLIENTONLY)) {
+                int dx = ptCli.x - rcExt.left;
+                int dy = ptCli.y - rcExt.top;
+                BitBlt(hMem, dx, dy, cw, ch, hCli, 0, 0, SRCCOPY);
+            } else {
+                int dx = ptCli.x - rcExt.left;
+                int dy = ptCli.y - rcExt.top;
+                BitBlt(hMem, dx, dy, cw, ch, hScreen, ptCli.x, ptCli.y, SRCCOPY);
+            }
+            SelectObject(hCli, hCliOld);
+        }
+        if (hCliBmp) DeleteObject(hCliBmp);
+        if (hCli) DeleteDC(hCli);
+    }
+
+    SelectObject(hMem, hOld);
+    ReleaseDC(NULL, hScreen);
+    DeleteDC(hMem);
+    if (outExt) *outExt = rcExt;
+    return hBmp;
+}
+
+// Blit helper: draw a bitmap at a given destination offset
+static void BlitBitmap(HDC dst, int dx, int dy, HBITMAP bmp, int w, int h) {
+    HDC src = CreateCompatibleDC(dst);
+    if (!src) return;
+    HBITMAP old = (HBITMAP)SelectObject(src, bmp);
+    BitBlt(dst, dx, dy, w, h, src, 0, 0, SRCCOPY);
+    SelectObject(src, old);
+    DeleteDC(src);
+}
+
+// Capture union of owner (as background) then child (overlay)
+static void CaptureWindowUnion(HWND child, HWND behind) {
+    if (!IsWindow(child) || !IsWindow(behind)) return;
+
+    RECT rcChildExt{}, rcBehindExt{};
+    HBITMAP bmpChild = RenderWindowBitmap(child, &rcChildExt);
+    HBITMAP bmpBehind = RenderWindowBitmap(behind, &rcBehindExt);
+    if (!bmpChild || !bmpBehind) {
+        if (bmpChild) DeleteObject(bmpChild);
+        if (bmpBehind) DeleteObject(bmpBehind);
+        return;
+    }
+
+    RECT rcU;
+    rcU.left   = min(rcChildExt.left,   rcBehindExt.left);
+    rcU.top    = min(rcChildExt.top,    rcBehindExt.top);
+    rcU.right  = max(rcChildExt.right,  rcBehindExt.right);
+    rcU.bottom = max(rcChildExt.bottom, rcBehindExt.bottom);
+    int w = rcU.right - rcU.left;
+    int h = rcU.bottom - rcU.top;
+    if (w <= 0 || h <= 0) {
+        DeleteObject(bmpChild);
+        DeleteObject(bmpBehind);
+        return;
+    }
+
+    HDC hScreen = GetDC(NULL);
+    HDC hMem = CreateCompatibleDC(hScreen);
+    HBITMAP hOut = CreateCompatibleBitmap(hScreen, w, h);
+    if (!hMem || !hOut) {
+        if (hOut) DeleteObject(hOut);
+        if (hMem) DeleteDC(hMem);
+        ReleaseDC(NULL, hScreen);
+        DeleteObject(bmpChild);
+        DeleteObject(bmpBehind);
+        return;
+    }
+    HBITMAP old = (HBITMAP)SelectObject(hMem, hOut);
+    RECT rFill = {0,0,w,h};
+    FillRect(hMem, &rFill, (HBRUSH)GetStockObject(WHITE_BRUSH));
+
+    // Draw parent then child at their offsets relative to union
+    int pw = rcBehindExt.right - rcBehindExt.left;
+    int ph = rcBehindExt.bottom - rcBehindExt.top;
+    int cw = rcChildExt.right - rcChildExt.left;
+    int ch = rcChildExt.bottom - rcChildExt.top;
+    BlitBitmap(hMem, rcBehindExt.left - rcU.left, rcBehindExt.top - rcU.top, bmpBehind, pw, ph);
+    BlitBitmap(hMem, rcChildExt.left - rcU.left, rcChildExt.top - rcU.top, bmpChild, cw, ch);
+
+    SelectObject(hMem, old);
+
+    // Save final composite
+    Bitmap bitmap(hOut, NULL);
+    std::wstring path = GenerateFileName(child);
+    path = EnsureUniquePath(path);
+    CLSID pngClsid;
+    if (GetEncoderClsid(L"image/png", &pngClsid) >= 0) {
+        bitmap.Save(path.c_str(), &pngClsid, NULL);
+    }
+    DeleteObject(hOut);
+    DeleteDC(hMem);
+    ReleaseDC(NULL, hScreen);
+    DeleteObject(bmpChild);
+    DeleteObject(bmpBehind);
 }
 
 static LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -172,18 +336,29 @@ static LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
         MSG* pMsg = (MSG*)lParam;
         if (pMsg->message == WM_KEYUP && pMsg->wParam == VK_F11) {
             // The hwnd in the MSG is the window/control receiving the key.
-            HWND target = pMsg->hwnd;
-            // Prefer the root of the parent chain (ignores owner), so a control inside
-            // a modal dialog resolves to the dialog itself, not the main window owner.
-            HWND root = target ? GetAncestor(target, GA_ROOT) : NULL;
-            if (root) {
-                target = root;
-            } else {
+            HWND hwndMsg = pMsg->hwnd;
+            HWND root = hwndMsg ? GetAncestor(hwndMsg, GA_ROOT) : NULL;
+            HWND rootOwner = hwndMsg ? GetAncestor(hwndMsg, GA_ROOTOWNER) : NULL;
+            if (!root) {
                 // Fallback if hwnd is null: foreground window
-                HWND fg = GetForegroundWindow();
-                if (fg) target = fg;
+                root = GetForegroundWindow();
+                rootOwner = root ? GetAncestor(root, GA_ROOTOWNER) : NULL;
             }
-            if (target) CaptureWindow(target);
+
+            // If Shift is down and the target is not the main application window,
+            // include the parent (owner) as background.
+            bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (shiftDown && root) {
+                // Determine parent by WindowFromPoint a few pixels above the centered top of the child
+                HWND parentByPoint = FindLikelyParentByPoint(root);
+                if (parentByPoint && parentByPoint != root) {
+                    CaptureWindowUnion(root, parentByPoint);
+                } else {
+                    CaptureWindow(root);
+                }
+            } else if (root) {
+                CaptureWindow(root);
+            }
         }
     }
     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
