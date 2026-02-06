@@ -19,9 +19,9 @@ target_compile_definitions(ScreenCapture PRIVATE UNICODE _UNICODE)
 
 # Link required Windows libraries
 if(MSVC)
-  target_link_libraries(ScreenCapture PRIVATE Gdiplus Shlwapi Gdi32 User32)
+  target_link_libraries(ScreenCapture PRIVATE Gdiplus Shlwapi Gdi32 User32 Dwmapi)
 else()
-  target_link_libraries(ScreenCapture PRIVATE gdiplus shlwapi gdi32 user32)
+  target_link_libraries(ScreenCapture PRIVATE gdiplus shlwapi gdi32 user32 dwmapi)
 endif()
 
 set_target_properties(ScreenCapture PROPERTIES OUTPUT_NAME "ScreenCapture")

@@ -18,6 +18,7 @@ Outputs: `ScreenCapture.dll` (plus import lib for your toolchain).
 - Call `RecordScreen` once (per UI thread) with a UTF‑8 directory path; it:
   - Stores the base output directory
   - Installs a thread‑local `WH_GETMESSAGE` hook in the calling thread
+  - Subsequent calls to `RecordScreen` on the same thread only update the output directory; the hook is not reinstalled
 - Press hotkeys in that thread’s message loop:
   - F11: capture the active top‑level window (uses `GetAncestor(hwnd, GA_ROOT)`).
   - Shift+F11: capture a composite of the active window and the window directly beneath it in Z‑order.
@@ -35,7 +36,7 @@ Outputs: `ScreenCapture.dll` (plus import lib for your toolchain).
 
 ### File Naming
 - Output dir: the `path` you passed to `RecordScreen`
-- File name: sanitized window title (or class) with `.png`
+- File name: sanitized window title (or class) with `.png`; spaces become `_`, characters lowercased, illegal filename chars replaced with `_`
 - Conflicts: auto‑appends `-N` to keep names unique
 
 ## Example (native C++)
