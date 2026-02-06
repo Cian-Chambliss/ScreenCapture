@@ -1,0 +1,4 @@
+LIBRARY "ScreenCapture"
+EXPORTS
+    ; Preserve undecorated name for 32-bit stdcall (MSVC/MinGW symbol is _RecordScreen@4)
+    RecordScreen=_RecordScreen@4
