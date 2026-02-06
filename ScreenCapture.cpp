@@ -5,11 +5,13 @@
 #include <windows.h>
 #include <gdiplus.h>
 #include <shlwapi.h>
+#include <dwmapi.h>
 #include <string>
 #include <sstream>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 using namespace Gdiplus;
 
@@ -98,27 +100,56 @@ static std::wstring EnsureUniquePath(const std::wstring& path) {
 static void CaptureWindow(HWND hwnd) {
     if (!IsWindow(hwnd)) return;
 
-    RECT rc;
-    if (!GetWindowRect(hwnd, &rc)) return;
-    int width = rc.right - rc.left;
-    int height = rc.bottom - rc.top;
-    if (width <= 0 || height <= 0) return;
-
-    // Capture relative to the window's own DC so origin is its top-left
-    HDC hWndDC = GetWindowDC(hwnd);
-    if (!hWndDC) return;
-    HDC hMemDC = CreateCompatibleDC(hWndDC);
-    HBITMAP hBitmap = CreateCompatibleBitmap(hWndDC, width, height);
-    if (!hBitmap) {
-        DeleteDC(hMemDC);
-        ReleaseDC(hwnd, hWndDC);
-        return;
+    RECT rcWin;
+    if (!GetWindowRect(hwnd, &rcWin)) return;
+    RECT rcExt = rcWin;
+    // Try to get extended frame bounds (includes DWM shadows)
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExt, sizeof(rcExt)))) {
+        // rcExt now may be larger than rcWin
     }
-    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBitmap);
-    BitBlt(hMemDC, 0, 0, width, height, hWndDC, 0, 0, SRCCOPY);
-    SelectObject(hMemDC, hOldBmp);
-    DeleteDC(hMemDC);
-    ReleaseDC(hwnd, hWndDC);
+    int extW = rcExt.right - rcExt.left;
+    int extH = rcExt.bottom - rcExt.top;
+    if (extW <= 0 || extH <= 0) return;
+
+    // Strategy: capture from screen first (visible content, includes border/shadow),
+    // then try PrintWindow to overlay the exact window contents (helps with occlusion).
+    HBITMAP hBitmap = NULL;
+    HDC hScreenDC = GetDC(NULL);
+    if (!hScreenDC) return;
+    HDC hExtDC = CreateCompatibleDC(hScreenDC);
+    HBITMAP hExtBmp = CreateCompatibleBitmap(hScreenDC, extW, extH);
+    if (hExtBmp && hExtDC) {
+        HBITMAP hExtOld = (HBITMAP)SelectObject(hExtDC, hExtBmp);
+        // First, copy what's on screen over the extended bounds
+        BitBlt(hExtDC, 0, 0, extW, extH, hScreenDC, rcExt.left, rcExt.top, SRCCOPY);
+
+        // Now attempt PrintWindow into a window-sized temp and overlay into extended bmp
+        int winW = rcWin.right - rcWin.left;
+        int winH = rcWin.bottom - rcWin.top;
+        HDC hWinDC = CreateCompatibleDC(hScreenDC);
+        HBITMAP hWinBmp = CreateCompatibleBitmap(hScreenDC, winW, winH);
+        if (hWinDC && hWinBmp) {
+            HBITMAP hWinOld = (HBITMAP)SelectObject(hWinDC, hWinBmp);
+            BOOL ok = PrintWindow(hwnd, hWinDC, 0 /* flags 0 give more consistent output */);
+            int dx = rcWin.left - rcExt.left;
+            int dy = rcWin.top - rcExt.top;
+            if (ok) {
+                BitBlt(hExtDC, dx, dy, winW, winH, hWinDC, 0, 0, SRCCOPY);
+            }
+            SelectObject(hWinDC, hWinOld);
+        }
+        if (hWinBmp) DeleteObject(hWinBmp);
+        if (hWinDC) DeleteDC(hWinDC);
+
+        SelectObject(hExtDC, hExtOld);
+        hBitmap = hExtBmp;
+    } else if (hExtBmp) {
+        DeleteObject(hExtBmp);
+    }
+    if (hExtDC) DeleteDC(hExtDC);
+    ReleaseDC(NULL, hScreenDC);
+
+    if (!hBitmap) return;
 
     // Convert HBITMAP to GDI+ Bitmap
     Bitmap bitmap(hBitmap, NULL);
